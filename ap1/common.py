@@ -49,12 +49,15 @@ ADAPTER_SHA256 = "afe1d69c1ce4170875989c5866bb2ec7b5089fc895efa699ced826317e3777
 EVALUATOR_COMMIT = "0b74d410b45e7b3efcf08d00ce58e7bd7017b757"
 EVALUATOR_WHEEL_SHA256 = "e3fcc769c440ed232ad05117f256739daf233e0c9f6d3d46586adc0de9b48c51"
 VIOLATION_MODE = "strict"
-# Expected availability posture used ONLY for the policy-excluded dry run (the
-# variable itself is unreadable with GITHUB_TOKEN; the writer proves it later).
-DRYRUN_POSTURE = "open"
-DRYRUN_POLICY_VERSION = "ap1-b21-policy-unverified"
+# Expected availability posture: an owner-approved constant matching the lab's
+# MNEME_CI_AVAILABILITY variable (closed). The variable itself is unreadable with
+# GITHUB_TOKEN, so the live policy check is pending: the writer must prove it.
+APPROVED_POSTURE = "closed"
+APPROVED_POLICY_VERSION = "ap1-b21-approved-policy-v1"
 
 PINS_FILE = "ap1/PINS.sha256"
+PUBLISHER_FILE = "ap1-feedback-publisher.yml"
+OWN_REF = "refs/heads/" + DEFAULT_BRANCH
 API = "https://api.github.com"
 REDIRECT_SUFFIXES = (".blob.core.windows.net", ".githubusercontent.com")
 TIMEOUT = 20
@@ -271,6 +274,43 @@ def utc_seconds(value: Any, *, ceil: bool) -> str | None:
 
 
 # ── identity of the producer gate run ────────────────────────────────────────
+
+# ── identity of this publisher run ───────────────────────────────────────────
+
+def own_identity(api: Any, env: dict, git_head: str) -> None:
+    """Fail closed unless this run is a first-attempt workflow_run of the default-branch publisher."""
+    run_id = dec(env.get("GITHUB_RUN_ID"), "OWN_RUN_ID")
+    require(env.get("GITHUB_RUN_ATTEMPT") == "1", "OWN_ATTEMPT")
+    require(env.get("GITHUB_EVENT_NAME") == "workflow_run", "OWN_EVENT")
+    require(env.get("GITHUB_REF") == OWN_REF, "OWN_REF")
+    require(SHA40_RE.fullmatch(git_head or "") is not None and env.get("GITHUB_SHA") == git_head, "OWN_SHA")
+    st, run = api.get(f"/repos/{REPO}/actions/runs/{run_id}")
+    require(st == 200 and isinstance(run, dict), "OWN_RUN_UNREADABLE")
+    require(run.get("id") == int(run_id), "OWN_RUN_ID")
+    require(is_int(run.get("run_attempt")) and run["run_attempt"] == 1, "OWN_ATTEMPT")
+    require(run.get("path") == PUBLISHER_PATH, "OWN_PATH")
+    require(run.get("event") == "workflow_run", "OWN_EVENT")
+    require(dig(run, "repository", "id") == REPO_ID, "OWN_REPO")
+
+
+class Recorder:
+    """Wraps an api and records the HTTP status of each distinct call shape (no bodies, no ids)."""
+
+    def __init__(self, api: Any) -> None:
+        self._api = api
+        self.calls: list[dict[str, Any]] = []
+
+    def get(self, path: str, params: dict[str, Any] | None = None) -> tuple[int, Any]:
+        st, obj = self._api.get(path, params)
+        label = re.sub(r"(?<=/)([0-9a-f]{40}|[0-9]+)(?=/|$)", "N", path)[:100]
+        label = label if TOKEN_RE.fullmatch(label) else "INVALID"
+        if len(self.calls) < 24 and not any(c["call"] == label and c["status"] == st for c in self.calls):
+            self.calls.append({"call": label, "status": st})
+        return st, obj
+
+    def download(self, path: str, cap: int = ZIP_CAP) -> bytes:
+        return self._api.download(path, cap)
+
 
 def _pr_head_ok(pull: Any, head: str) -> bool:
     return (is_int(dig(pull, "number")) and dig(pull, "state") == "open"

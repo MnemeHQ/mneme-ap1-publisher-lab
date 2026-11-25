@@ -41,27 +41,45 @@ def observe_approvals(api, run_id: str) -> dict:
 
 def run(env: dict, api, repo_root: str) -> dict:
     """Returns the evidence dict. Never raises."""
+    rec = C.Recorder(api)
     ev: dict = {"schema": "ap1.write-canary.v1", "reject": None, "environment": C.ENVIRONMENT,
                 "secrets_referenced": False, "github_writes": False}
     try:
         gate_id = C.dec(env.get("GATE_RUN_ID"), "BAD_GATE_RUN")
         resolved_pr = C.dec(env.get("RESOLVED_PR"), "BAD_RESOLVED_PR")
         resolved_gate = C.dec(env.get("RESOLVED_GATE_RUN"), "BAD_RESOLVED_GATE_RUN")
+        resolved_manifest = env.get("RESOLVED_MANIFEST_SHA256", "")
         C.require(resolved_gate == gate_id, "GATE_RUN_CHANGED")
         run_id = C.dec(env.get("GITHUB_RUN_ID"), "BAD_RUN_ID")
+        head = R.git_head(repo_root)
         ev["publisher"] = {"run_id": run_id, "run_attempt": env.get("GITHUB_RUN_ATTEMPT"),
                            "event": env.get("GITHUB_EVENT_NAME"), "ref": env.get("GITHUB_REF"),
-                           "sha": env.get("GITHUB_SHA")}
-        ev["h15a"] = R.observe_self(api, env, R.git_head(repo_root))
-        ev["approval_context"] = observe_approvals(api, run_id)
-        ctx = C.gate_context(api, gate_id)
+                           "sha": env.get("GITHUB_SHA"), "github_sha_vs_git_head":
+                           "match" if env.get("GITHUB_SHA") == head else "mismatch"}
+        manifest = C.sha256_file(os.path.join(repo_root, C.PINS_FILE))
+        ev["manifest"] = {"recomputed_sha256": manifest, "resolver_sha256": resolved_manifest,
+                          "equal": manifest == resolved_manifest}
+        ev["h15a"] = R.observe_self(rec, env, head)
+        ev["approval_context"] = observe_approvals(rec, run_id)
+        try:
+            C.own_identity(rec, env, head)
+            ev["own_identity"] = "ok"
+        except C.Reject as err:
+            ev["own_identity"] = err.code
+            raise
+        C.require(C.SHA256_RE.fullmatch(resolved_manifest) is not None and manifest == resolved_manifest,
+                  "MANIFEST_CHANGED")
+        ctx = C.gate_context(rec, gate_id)
         C.require(str(ctx["pr"]) == resolved_pr, "PR_CHANGED")
-        ev["gate"] = {"run_id": ctx["run"]["id"], "head_sha": ctx["head_sha"], "base_sha": ctx["base_sha"],
-                      "pr": ctx["pr"], "identity": "verified", "base_fresh": True}
+        ev["gate"] = {"run_id": ctx["run"]["id"], "head_sha": ctx["head_sha"],
+                      "head_branch": ctx["run"].get("head_branch"), "base_sha": ctx["base_sha"],
+                      "pr": ctx["pr"], "pr_base_ref": C.dig(ctx["pull"], "base", "ref"),
+                      "identity": "partially_verified", "base_fresh_at_canary": True}
     except C.Reject as err:
         ev["reject"] = err.code
     except Exception:  # noqa: BLE001
         ev["reject"] = "INTERNAL"
+    ev["http_statuses"] = rec.calls
     return ev
 
 

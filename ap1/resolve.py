@@ -51,10 +51,10 @@ def build_config(workflow_id: int, definition_blob: str, bot_id: int) -> dict:
         "producer": {"workflow_id": workflow_id, "path": C.GATE_PATH, "event": C.GATE_EVENT,
                      "gate_job_name": C.GATE_JOB, "evaluate_step": C.EVAL_STEP},
         "producer_definition": {"path": C.GATE_PATH, "blob_sha": definition_blob},
-        "policy_version": C.DRYRUN_POLICY_VERSION,
+        "policy_version": C.APPROVED_POLICY_VERSION,
         "pins": {"adapter_sha256": C.ADAPTER_SHA256, "evaluator_commit": C.EVALUATOR_COMMIT,
                  "evaluator_wheel_sha256": C.EVALUATOR_WHEEL_SHA256, "mode": C.VIOLATION_MODE,
-                 "posture": C.DRYRUN_POSTURE},
+                 "posture": C.APPROVED_POSTURE},
         "publisher": {"actor_id": bot_id, "marker": C.MARKER, "names": list(C.PUBLISHER_NAMES)},
         "required_checks": [C.GATE_JOB],
         "limits": {"body_cap": 49152, "archive_compressed_max": C.ZIP_CAP,
@@ -118,7 +118,7 @@ def build_observed(ctx: dict, artifact: dict, zip_b64: str, definition_blob: str
 
 # ── observation helpers ──────────────────────────────────────────────────────
 
-def observe_self(api, env: dict, git_head: str) -> dict:
+def observe_self(api, env: dict, git_head: str, gate: dict | None = None) -> dict:
     """H15a: what the host says about THIS run versus what the job sees."""
     rid = C.dec(env.get("GITHUB_RUN_ID"), "BAD_RUN_ID")
     st, run = api.get(f"/repos/{C.REPO}/actions/runs/{rid}")
@@ -139,6 +139,12 @@ def observe_self(api, env: dict, git_head: str) -> dict:
     rec["run_head_sha_vs_git_head"] = flag(run.get("head_sha") == git_head)
     rec["github_sha_vs_git_head"] = flag(gsha == git_head)
     rec["run_head_branch_vs_github_ref"] = flag(ref_name is not None and run.get("head_branch") == ref_name)
+    rec["repository_id"] = C.dig(run, "repository", "id")
+    st, wf = api.get(f"/repos/{C.REPO}/actions/workflows/{C.PUBLISHER_FILE}")
+    rec["workflow_id_vs_file_lookup"] = flag(st == 200 and C.dig(wf, "id") == run.get("workflow_id"))
+    if gate is not None:  # what the host reports for a workflow_run: the triggering run's head, or main's?
+        rec["run_head_sha_vs_gate_head_sha"] = flag(run.get("head_sha") == gate.get("head_sha"))
+        rec["run_head_branch_vs_gate_head_branch"] = flag(run.get("head_branch") == gate.get("head_branch"))
     return rec
 
 
@@ -202,23 +208,32 @@ def run(env: dict, api, repo_root: str, core_dir: str, head: str) -> tuple[dict,
         out["gate_run"] = gate_id
         ev["publisher"] = {"run_id": env.get("GITHUB_RUN_ID"), "run_attempt": env.get("GITHUB_RUN_ATTEMPT"),
                            "event": env.get("GITHUB_EVENT_NAME"), "ref": env.get("GITHUB_REF")}
-        ev["h15a"] = observe_self(api, env, head)
-
         ctx = C.gate_context(api, gate_id)
         out["pr"] = str(ctx["pr"])
         ev["gate"] = {"run_id": ctx["run"]["id"], "run_number": ctx["run"]["run_number"],
                       "workflow_id": ctx["run"]["workflow_id"], "conclusion": ctx["run"].get("conclusion"),
                       "job_conclusion": ctx["job"].get("conclusion"),
                       "evaluate_step_conclusion": ctx["eval_step"].get("conclusion"),
-                      "head_sha": ctx["head_sha"], "base_sha": ctx["base_sha"], "pr": ctx["pr"],
-                      "identity": "verified", "base_fresh": True}
+                      "head_sha": ctx["head_sha"], "head_branch": ctx["run"].get("head_branch"),
+                      "base_sha": ctx["base_sha"], "pr": ctx["pr"],
+                      "pr_base_ref": C.dig(ctx["pull"], "base", "ref"),
+                      "identity": "partially_verified", "base_fresh_at_resolve": True}
+        ev["h15a"] = observe_self(api, env, head, {"head_sha": ctx["head_sha"],
+                                                   "head_branch": ctx["run"].get("head_branch")})
+        try:  # own-run identity gates write_candidate; the observations above are kept either way
+            C.own_identity(api, env, head)
+            ev["own_identity"] = "ok"
+        except C.Reject as err:
+            ev["own_identity"] = err.code
 
         artifact, zip_bytes = fetch_artifact(api, gate_id, ctx["pr"])
         ev["artifact"] = {"count": 1, "size": artifact["size_in_bytes"], "expired": False, "zip": "inspected_ok"}
 
         # Policy-metadata feasibility: status only, never a fallback.
         st, _ = api.get(f"/repos/{C.REPO}/actions/variables/{C.VARIABLE_NAME}")
-        ev["policy"] = {"variable_http_status": st, "pending_for_writer": True}
+        ev["policy"] = {"variable_http_status": st, "live_check": "pending_writer",
+                        "expected_posture": C.APPROVED_POSTURE,
+                        "expected_posture_label": "closed_owner_approved_constant"}
 
         raw_comments, complete, cst = C.paged(api, f"/repos/{C.REPO}/issues/{ctx['pr']}/comments", {})
         views, counts = comment_views(raw_comments)
@@ -236,8 +251,9 @@ def run(env: dict, api, repo_root: str, core_dir: str, head: str) -> tuple[dict,
         remote_blob = C.dig(contents, "sha")
         with open(os.path.join(repo_root, C.GATE_PATH), "rb") as fh:
             local_blob = C.blob_sha1(fh.read())
-        ev["definition"] = {"http_status": st, "remote_vs_pinned_local": "match" if remote_blob == local_blob
-                            else "mismatch"}
+        # The definition the gate run actually used is NOT observable: both blobs are main's copy.
+        ev["definition"] = {"binding": "main_copy_assumed_not_observed", "http_status": st,
+                            "main_tip_blob_equals_checkout": remote_blob == local_blob}
 
         st, bot = api.get("/users/mneme-ap1-lab-publisher%5Bbot%5D")
         bot_ok = st == 200 and C.dig(bot, "login") == C.BOT_LOGIN and C.dig(bot, "type") == "Bot" \
@@ -251,18 +267,18 @@ def run(env: dict, api, repo_root: str, core_dir: str, head: str) -> tuple[dict,
         observed = build_observed(ctx, artifact, zip_b64, local_blob, others, runs_complete, views, complete)
         actual = planner.plan(copy.deepcopy(config), copy.deepcopy(observed))
         modelled = copy.deepcopy(observed)
-        modelled["policy"] = {k: {"posture": C.DRYRUN_POSTURE, "version": C.DRYRUN_POLICY_VERSION} for k in OBS}
+        modelled["policy"] = {k: {"posture": C.APPROVED_POSTURE, "version": C.APPROVED_POLICY_VERSION} for k in OBS}
         dry = planner.plan(copy.deepcopy(config), modelled)
         ev["plan"] = {"actual_action": actual.get("action"), "actual_reason": actual.get("reason"),
                       "dry_run_action": dry.get("action"), "dry_run_reason": dry.get("reason"),
-                      "dry_run_models_policy": True, "modelled_replicated_observations": True}
+                      "policy_observations": "pending_writer", "before_write_after_write": "pending_writer"}
         if dry.get("action") in C.ACTIONS:
             out["action"] = dry["action"]
-        gate_ok = (ev["gate"]["identity"] == "verified" and ev["definition"]["remote_vs_pinned_local"] == "match"
+        gate_ok = (ev["own_identity"] == "ok" and ev["definition"]["main_tip_blob_equals_checkout"]
                    and ev["h15a"].get("http_status") == 200)
         if dry.get("action") in ("CREATE", "UPDATE") and gate_ok:
             out["write_candidate"] = "true"
-            ev["write_candidate_basis"] = "dry_run_with_modelled_policy"
+            ev["write_candidate_basis"] = "conditional_non_policy_checks_resolve_time_only"
     except C.Reject as err:
         ev["reject"] = err.code
     except Exception:  # noqa: BLE001 - any fault is NO_WRITE, never a write candidate
@@ -296,7 +312,8 @@ def render_summary(env: dict, out: dict) -> str:
         f"- Repository id: `{C.REPO_ID}`\n"
         f"- Pull request: `{out['pr']}`\n"
         f"- Proposed action: `{out['action']}`\n"
-        "Policy check: pending (verified by writer before any write)\n"
+        f"- Expected posture (owner-approved constant, not verified): `{C.APPROVED_POSTURE}`\n"
+        "\nPolicy check: pending (verified by writer before any write)\n"
     )
 
 

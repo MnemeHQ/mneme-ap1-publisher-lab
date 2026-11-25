@@ -27,8 +27,14 @@ def test_happy_path_is_candidate_but_real_plan_abstains_on_policy(world, core_di
     assert out["manifest_sha256"] != ZERO
     assert ev["plan"]["actual_action"] == "NO_WRITE" and ev["plan"]["actual_reason"] == "POLICY_UNPROVEN"
     assert ev["plan"]["dry_run_action"] == "CREATE"
-    assert ev["policy"] == {"variable_http_status": 403, "pending_for_writer": True}
-    assert ev["write_candidate_basis"] == "dry_run_with_modelled_policy"
+    assert ev["policy"] == {"variable_http_status": 403, "live_check": "pending_writer",
+                            "expected_posture": "closed", "expected_posture_label": "closed_owner_approved_constant"}
+    assert ev["write_candidate_basis"] == "conditional_non_policy_checks_resolve_time_only"
+    assert ev["plan"]["policy_observations"] == "pending_writer"
+    assert ev["plan"]["before_write_after_write"] == "pending_writer"
+    assert "modelled" not in json.dumps(ev) and "verified" not in json.dumps(ev["definition"])
+    assert ev["definition"]["binding"] == "main_copy_assumed_not_observed"
+    assert ev["gate"]["identity"] == "partially_verified" and ev["own_identity"] == "ok"
     C.format_outputs(out)  # validates
 
 
@@ -38,7 +44,10 @@ def test_h15a_flags_recorded(world, core_dir, repo_root):
     assert h["run_head_sha_vs_github_sha"] == "mismatch"  # GITHUB_SHA is 'a'*40 here, run head is the PR head
     assert h["github_sha_vs_git_head"] == "match"
     assert h["run_head_branch_vs_github_ref"] == "mismatch"
+    assert h["run_head_sha_vs_gate_head_sha"] == "match" and h["run_head_branch_vs_gate_head_branch"] == "match"
+    assert h["workflow_id_vs_file_lookup"] == "match" and h["repository_id"] == C.REPO_ID
     assert h["event"] == "workflow_run" and h["run_attempt"] == 1
+    assert ev["gate"]["head_branch"] == "feat/x" and ev["gate"]["pr_base_ref"] == "main"
 
 
 def test_evidence_has_no_bodies_and_is_bounded(world, core_dir, repo_root):
@@ -154,11 +163,44 @@ def test_later_gate_run_makes_this_one_stale(world, core_dir, repo_root):
     assert out["write_candidate"] == "false" and ev["plan"]["dry_run_reason"] == "STALE_RUN"
 
 
-def test_closed_posture_report_is_unavailable_not_candidate(core_dir, repo_root):
-    w = World(report("L1"), repo_root)  # recorded posture closed; expected (modelled) posture is open
+def test_open_posture_report_is_unavailable_not_candidate(core_dir, repo_root):
+    w = World(report("L5"), repo_root)  # recorded posture open; the approved constant is closed
     out, ev = _go(w, core_dir, repo_root)
     assert out["write_candidate"] == "false" and out["action"] == "UNAVAILABLE"
     assert ev["plan"]["dry_run_reason"] == "REPORT_UNAVAILABLE"
+
+
+def test_closed_posture_reports_give_a_candidate(core_dir, repo_root):
+    clean = World(report("L1"), repo_root)
+    out, _ = _go(clean, core_dir, repo_root)
+    assert out["action"] == "CREATE" and out["write_candidate"] == "true"
+    viol = report("L5")  # strict violation, recorded under open; re-recorded as closed (still failure)
+    viol["posture"] = dict(viol["posture"], effective="closed")
+    w = World(viol, repo_root)
+    out, ev = _go(w, core_dir, repo_root)
+    assert ev["plan"]["dry_run_action"] == "CREATE" and out["write_candidate"] == "true", ev["plan"]
+
+
+OWN_FAILURES = {
+    "env_attempt_2": lambda w: w.env.__setitem__("GITHUB_RUN_ATTEMPT", "2"),
+    "run_attempt_2": lambda w: w.own.__setitem__("run_attempt", 2),
+    "wrong_path": lambda w: w.own.__setitem__("path", ".github/workflows/other.yml"),
+    "wrong_event_env": lambda w: w.env.__setitem__("GITHUB_EVENT_NAME", "push"),
+    "wrong_event_run": lambda w: w.own.__setitem__("event", "push"),
+    "wrong_repo": lambda w: w.own.__setitem__("repository", {"id": 3}),
+    "wrong_ref": lambda w: w.env.__setitem__("GITHUB_REF", "refs/heads/evil"),
+    "sha_not_head": lambda w: w.env.__setitem__("GITHUB_SHA", "b" * 40),
+    "own_run_unreadable": lambda w: w.env.__setitem__("GITHUB_RUN_ID", "424242"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(OWN_FAILURES))
+def test_wrong_own_run_identity_is_never_a_candidate(name, world, core_dir, repo_root):
+    OWN_FAILURES[name](world)
+    out, ev = _go(world, core_dir, repo_root)
+    assert out["write_candidate"] == "false"
+    assert ev["own_identity"].startswith("OWN_") and ev["reject"] is None  # observations are still recorded
+    assert ev["plan"]["dry_run_action"] == "CREATE"  # the gate side was fine; only own identity blocks
 
 
 def test_exception_in_planner_is_no_write(world, core_dir, repo_root, monkeypatch):
@@ -197,7 +239,7 @@ def test_hostile_comment_and_report_text_never_leaks(world, core_dir, repo_root,
     # comments that merely contain hostile text (no marker first line) are ignored by the planner
     assert ev["comments"]["foreign_marker"] == 0 and ev["comments"]["count"] == len(HOSTILE)
     # every line of the summary is from the fixed template
-    allowed = re.compile(r"^(## AP1 feedback resolve \(B2\.1, read-only\)|- [A-Za-z -]+: `[A-Za-z0-9._/:@-]+`( \(attempt `[A-Za-z0-9]+`\))?|"
+    allowed = re.compile(r"^(## AP1 feedback resolve \(B2\.1, read-only\)|- [A-Za-z -]+( \([A-Za-z ,-]+\))?: `[A-Za-z0-9._/:@-]+`( \(attempt `[A-Za-z0-9]+`\))?|"
                          r"Policy check: pending \(verified by writer before any write\)|)$")
     assert all(allowed.match(l) for l in summary.split("\n")), summary
 
@@ -206,7 +248,7 @@ def test_summary_fixed_fields(world):
     out = {"action": "CREATE", "write_candidate": "true", "pr": "7", "gate_run": "55", "manifest_sha256": "ab" * 32}
     s = R.render_summary(dict(world.env), out)
     for needle in (C.PUBLISHER_PATH, "`workflow_run`", "refs/heads/main", f"`{world.OWN}`", "`55`", "ab" * 32,
-                   str(C.REPO_ID), "Proposed action: `CREATE`",
+                   str(C.REPO_ID), "Proposed action: `CREATE`", "Expected posture (owner-approved constant, not verified): `closed`",
                    "Policy check: pending (verified by writer before any write)"):
         assert needle in s
     bad = R.render_summary(dict(world.env, GITHUB_EVENT_NAME="push"), out)
@@ -248,8 +290,13 @@ def test_main_without_token_is_no_write(tmp_path, monkeypatch):
 
 # ── write canary ─────────────────────────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _fake_git_head(monkeypatch):
+    monkeypatch.setattr(R, "git_head", lambda root: "a" * 40)
+
 def _canary_env(world):
-    return dict(world.env, RESOLVED_PR=str(world.PR), RESOLVED_GATE_RUN=str(world.GATE))
+    return dict(world.env, RESOLVED_PR=str(world.PR), RESOLVED_GATE_RUN=str(world.GATE),
+                RESOLVED_MANIFEST_SHA256=C.sha256_file(os.path.join(world.root, C.PINS_FILE)))
 
 
 def test_canary_records_context_and_writes_nothing(world, repo_root):
@@ -259,7 +306,11 @@ def test_canary_records_context_and_writes_nothing(world, repo_root):
                                             "environments": [{"name": C.ENVIRONMENT}], "comment": "::error::x"}])
     api.routes[R_ + "/pending_deployments"] = (403, None)
     ev = W.run(_canary_env(world), api, repo_root)
-    assert ev["reject"] is None and ev["gate"]["identity"] == "verified"
+    assert ev["reject"] is None and ev["gate"]["identity"] == "partially_verified"
+    assert ev["manifest"]["equal"] is True and ev["own_identity"] == "ok"
+    assert ev["publisher"]["github_sha_vs_git_head"] == "match"
+    calls = {(c["call"], c["status"]) for c in ev["http_statuses"]}
+    assert (f"/repos/{C.REPO}/commits/N/pulls", 200) in calls and (f"/repos/{C.REPO}/pulls/N", 200) in calls
     assert ev["approval_context"]["approvals"][0]["login"] == "TheoV823"
     assert ev["approval_context"]["pending_deployments_http_status"] == 403
     assert "::error" not in C.evidence_bytes(ev).decode()
@@ -277,10 +328,16 @@ def test_canary_approvals_denied_is_recorded(world, repo_root):
     lambda w, e: w.run.__setitem__("run_attempt", 2),
     lambda w, e: e.__setitem__("RESOLVED_PR", "8"),
     lambda w, e: e.__setitem__("RESOLVED_GATE_RUN", "1"),
+    lambda w, e: e.__setitem__("RESOLVED_MANIFEST_SHA256", "0" * 64),
+    lambda w, e: e.__setitem__("GITHUB_RUN_ATTEMPT", "2"),
+    lambda w, e: w.own.__setitem__("run_attempt", 2),
+    lambda w, e: w.own.__setitem__("path", "x"),
+    lambda w, e: e.__setitem__("GITHUB_REF", "refs/heads/evil"),
+    lambda w, e: e.__setitem__("GITHUB_SHA", "b" * 40),
     lambda w, e: e.__setitem__("RESOLVED_PR", "7\nx"),
 ])
 def test_canary_rechecks_identity(world, repo_root, mut):
     env = _canary_env(world)
     mut(world, env)
     ev = W.run(env, world.api(), repo_root)
-    assert ev["reject"] is not None and ev.get("gate", {}).get("identity") != "verified"
+    assert ev["reject"] is not None and "gate" not in ev

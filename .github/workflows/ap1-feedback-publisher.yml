@@ -11,12 +11,15 @@ name: Mneme AP1 feedback publisher
 #   a decimal in Python. Nothing from the event or from an artifact is
 #   interpolated into a run: script. Everything else is re-fetched by GET.
 # - Pin verification runs before any Python from ap1/ or core/ executes. The
-#   manifest ap1/PINS.sha256 lists sha256 + path for both workflow files,
-#   CODEOWNERS, every file under ap1/ and the two Core files used from
-#   MnemeHQ/mneme at the commit below (whose git blob ids and mode are also
-#   checked). The manifest's own hash is approved externally and is never
+#   manifest ap1/PINS.sha256 lists sha256 + path for every tracked file under
+#   .github/, ap1/ and .mneme/ (all must be regular 100644 files, with nothing
+#   untracked or extra) and the two Core files used from MnemeHQ/mneme at the
+#   commit below (whose git blob ids and mode are also checked). The manifest's own hash is approved externally and is never
 #   embedded in any file.
 # - The job names never equal or resemble the gate check "mneme trusted gate".
+# - Availability residual: with cancel-in-progress false GitHub keeps one pending
+#   run per group, so a burst of gate completions can drop publisher runs while a
+#   write job waits for approval. B2.1 records cancelled publisher runs.
 # - The key-using writer replaces the "AP1 feedback write" job only in a later,
 #   separately authorized PR.
 
@@ -87,11 +90,15 @@ jobs:
           }
           verify_core scripts/ci/render_pr_feedback.py "$CORE_RENDER_BLOB"
           verify_core scripts/ci/publish_pr_feedback.py "$CORE_PUBLISH_BLOB"
+          # Every tracked path under ap1/, .github/ and .mneme/ must be a regular
+          # 100644 file (no symlinks, no other modes), and the working tree must
+          # hold exactly those files: nothing untracked, ignored or extra.
+          if git ls-files -s -- ap1 .github .mneme | awk -F'\t' '{ split($1, m, " "); if (m[1] != "100644" || m[3] != "0") bad = 1 } END { exit bad }'; then :; else fail "tracked file mode"; fi
+          [ -z "$(find ap1 .github .mneme -mindepth 1 ! -type f ! -type d)" ] || fail "non-regular entry"
+          [ -z "$(git status --porcelain --ignored -- ap1 .github .mneme)" ] || fail "untracked or modified file"
+          [ "$(find ap1 .github .mneme -type f | sort)" = "$(git ls-files -- ap1 .github .mneme | sort)" ] || fail "worktree differs from index"
           if grep -Evq '^[0-9a-f]{64}  [A-Za-z0-9._/-]+$' ap1/PINS.sha256; then fail "manifest format"; fi
-          expected="$({ find ap1 -type f ! -name PINS.sha256; printf '%s\n' \
-            .github/CODEOWNERS \
-            .github/workflows/ap1-feedback-publisher.yml \
-            .github/workflows/mneme-trusted-gate.yml \
+          expected="$({ git ls-files -- ap1 .github .mneme | grep -Fxv ap1/PINS.sha256; printf '%s\n' \
             core/scripts/ci/render_pr_feedback.py \
             core/scripts/ci/publish_pr_feedback.py; } | sort)"
           listed="$(sed -E 's/^[0-9a-f]{64}  //' ap1/PINS.sha256 | sort)"
@@ -122,13 +129,14 @@ jobs:
     # except its own evidence artifact.
     name: AP1 feedback write
     needs: resolve
-    if: ${{ needs.resolve.outputs.write_candidate == 'true' }}
+    if: ${{ needs.resolve.outputs.write_candidate == 'true' && github.run_attempt == '1' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: ap1-publisher-lab
     permissions:
       actions: read
       contents: read
+      pull-requests: read
     steps:
       - name: Check out the lab at the workflow commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -162,11 +170,15 @@ jobs:
           }
           verify_core scripts/ci/render_pr_feedback.py "$CORE_RENDER_BLOB"
           verify_core scripts/ci/publish_pr_feedback.py "$CORE_PUBLISH_BLOB"
+          # Every tracked path under ap1/, .github/ and .mneme/ must be a regular
+          # 100644 file (no symlinks, no other modes), and the working tree must
+          # hold exactly those files: nothing untracked, ignored or extra.
+          if git ls-files -s -- ap1 .github .mneme | awk -F'\t' '{ split($1, m, " "); if (m[1] != "100644" || m[3] != "0") bad = 1 } END { exit bad }'; then :; else fail "tracked file mode"; fi
+          [ -z "$(find ap1 .github .mneme -mindepth 1 ! -type f ! -type d)" ] || fail "non-regular entry"
+          [ -z "$(git status --porcelain --ignored -- ap1 .github .mneme)" ] || fail "untracked or modified file"
+          [ "$(find ap1 .github .mneme -type f | sort)" = "$(git ls-files -- ap1 .github .mneme | sort)" ] || fail "worktree differs from index"
           if grep -Evq '^[0-9a-f]{64}  [A-Za-z0-9._/-]+$' ap1/PINS.sha256; then fail "manifest format"; fi
-          expected="$({ find ap1 -type f ! -name PINS.sha256; printf '%s\n' \
-            .github/CODEOWNERS \
-            .github/workflows/ap1-feedback-publisher.yml \
-            .github/workflows/mneme-trusted-gate.yml \
+          expected="$({ git ls-files -- ap1 .github .mneme | grep -Fxv ap1/PINS.sha256; printf '%s\n' \
             core/scripts/ci/render_pr_feedback.py \
             core/scripts/ci/publish_pr_feedback.py; } | sort)"
           listed="$(sed -E 's/^[0-9a-f]{64}  //' ap1/PINS.sha256 | sort)"
@@ -182,6 +194,7 @@ jobs:
           GATE_RUN_ID: ${{ github.event.workflow_run.id }}
           RESOLVED_PR: ${{ needs.resolve.outputs.pr }}
           RESOLVED_GATE_RUN: ${{ needs.resolve.outputs.gate_run }}
+          RESOLVED_MANIFEST_SHA256: ${{ needs.resolve.outputs.manifest_sha256 }}
           EVIDENCE_PATH: ${{ runner.temp }}/ap1-evidence/canary.json
         run: python3 -I ap1/write_canary.py
 

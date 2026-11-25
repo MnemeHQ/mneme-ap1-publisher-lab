@@ -32,6 +32,8 @@ REPORT_PATH = "docs/validation/adr033-c4-gate3-live-2026-10-26/probes/{}/artifac
 
 
 def _core_repo() -> Path | None:
+    if os.environ.get("AP1_CORE_REPO") == "-":  # explicitly no Core (used to check the fail/skip behaviour)
+        return None
     cands = [os.environ.get("AP1_CORE_REPO"), "C:/dev/mneme", str(ROOT.parent / "mneme")]
     for c in cands:
         if c and Path(c, ".git").exists():
@@ -45,7 +47,10 @@ def _core_repo() -> Path | None:
 def core_show(path: str) -> bytes:
     repo = _core_repo()
     if repo is None:
-        pytest.skip("no Core checkout holding the pinned commit")
+        msg = "no Core checkout holding the pinned commit (set AP1_CORE_REPO, or AP1_ALLOW_NO_CORE=1 to skip)"
+        if os.environ.get("AP1_ALLOW_NO_CORE") == "1":
+            pytest.skip(msg)
+        pytest.fail(msg)
     return subprocess.run(["git", "-C", str(repo), "show", f"{C.CORE_COMMIT}:{path}"], capture_output=True,
                           check=True).stdout
 
@@ -120,6 +125,7 @@ class World:
 
     def __init__(self, rep: dict, repo_root: str) -> None:
         self.rep = rep
+        self.root = repo_root
         self.head, self.base = rep["head_sha"], rep["base_sha"]
         with open(os.path.join(repo_root, C.GATE_PATH), "rb") as fh:
             self.blob = C.blob_sha1(fh.read())
@@ -127,7 +133,7 @@ class World:
         self.zip = make_zip([("gate-report.json", json.dumps(rep, indent=2).encode()), ("summary.md", b"# s\n")])
         self.art_name = f"mneme-gate-pr{self.PR}-{self.GATE}"
         self.run = {"id": self.GATE, "repository": {"id": C.REPO_ID}, "workflow_id": self.WF, "path": C.GATE_PATH,
-                    "event": C.GATE_EVENT, "status": "completed", "conclusion": self.conclusion, "run_number": 12,
+                    "event": C.GATE_EVENT, "head_branch": "feat/x", "status": "completed", "conclusion": self.conclusion, "run_number": 12,
                     "run_attempt": 1, "head_sha": self.head, "head_repository": {"id": C.REPO_ID}}
         self.job = {"name": C.GATE_JOB, "id": 9001, "run_id": self.GATE, "head_sha": self.head,
                     "status": "completed", "run_attempt": 1, "conclusion": self.conclusion,
@@ -143,7 +149,7 @@ class World:
                     "workflow_run": {"id": self.GATE, "repository_id": C.REPO_ID, "head_sha": self.head,
                                      "head_repository_id": C.REPO_ID}}
         self.own = {"id": self.OWN, "head_sha": self.head, "head_branch": "feat/x", "event": "workflow_run",
-                    "path": C.PUBLISHER_PATH, "run_attempt": 1, "workflow_id": 4343, "run_number": 3}
+                    "repository": {"id": C.REPO_ID}, "path": C.PUBLISHER_PATH, "run_attempt": 1, "workflow_id": 4343, "run_number": 3}
         self.comments: list = []
         self.other_runs = [{"id": self.GATE, "run_number": 12, "run_attempt": 1}]
         self.env = {"GITHUB_RUN_ID": str(self.OWN), "GITHUB_RUN_ATTEMPT": "1", "GITHUB_EVENT_NAME": "workflow_run",
@@ -162,6 +168,7 @@ class World:
             f"{R_}/actions/variables/{C.VARIABLE_NAME}": (403, None),
             f"{R_}/issues/{self.PR}/comments": (200, self.comments),
             f"{R_}/actions/workflows/{C.GATE_FILE}": (200, {"id": self.WF}),
+            f"{R_}/actions/workflows/{C.PUBLISHER_FILE}": (200, {"id": self.own["workflow_id"]}),
             f"{R_}/actions/workflows/{self.WF}/runs": (200, {"workflow_runs": self.other_runs}),
             f"{R_}/contents/{C.GATE_PATH}": (200, {"sha": self.blob}),
             "/users/mneme-ap1-lab-publisher%5Bbot%5D": (200, {"id": self.BOT, "login": C.BOT_LOGIN, "type": "Bot"}),
@@ -171,7 +178,8 @@ class World:
 
 @pytest.fixture()
 def world(repo_root):
-    return World(report("L5"), repo_root)
+    # L1: a clean PASS report recorded under the lab's closed posture (the approved constant)
+    return World(report("L1"), repo_root)
 
 
 def b64(data: bytes) -> str:
