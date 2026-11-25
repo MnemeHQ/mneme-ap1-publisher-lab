@@ -1,0 +1,208 @@
+name: Mneme AP1 feedback publisher
+
+# AP1.2 B2.1 lab bootstrap (MnemeHQ/mneme#846), synthetic only, NO KEY.
+# This workflow observes the producer gate run and plans a PR feedback comment.
+# It references no secret, mints no token and writes nothing to GitHub: no
+# comment, issue, check or status write, and no write permission anywhere.
+#
+# Trust boundary:
+# - workflow_run runs the DEFAULT-BRANCH copy of this file. The only value taken
+#   from the event is the triggering run id, passed through env and validated as
+#   a decimal in Python. Nothing from the event or from an artifact is
+#   interpolated into a run: script. Everything else is re-fetched by GET.
+# - Pin verification runs before any Python from ap1/ or core/ executes. The
+#   manifest ap1/PINS.sha256 lists sha256 + path for every tracked file under
+#   .github/, ap1/ and .mneme/ (all must be regular 100644 files, with nothing
+#   untracked or extra) and the two Core files used from MnemeHQ/mneme at the
+#   commit below (whose git blob ids and mode are also checked). The manifest's own hash is approved externally and is never
+#   embedded in any file.
+# - The job names never equal or resemble the gate check "mneme trusted gate".
+# - Availability residual: with cancel-in-progress false GitHub keeps one pending
+#   run per group, so a burst of gate completions can drop publisher runs while a
+#   write job waits for approval. B2.1 records cancelled publisher runs.
+# - The key-using writer replaces the "AP1 feedback write" job only in a later,
+#   separately authorized PR.
+
+on:
+  workflow_run:
+    workflows: ["Mneme trusted gate"]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: ap1-feedback-publisher
+  cancel-in-progress: false
+
+env:
+  CORE_REPOSITORY: MnemeHQ/mneme
+  CORE_COMMIT: 39ab6a59ecd015f0dfa4c79eae9634770511f4bf
+  CORE_RENDER_BLOB: 7317b2901222d9c3d42adbeb7daa83f6726fd1be
+  CORE_PUBLISH_BLOB: b38df72097741958c5ef63533ba57ae71568887f
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  resolve:
+    name: AP1 feedback resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      checks: read
+    outputs:
+      action: ${{ steps.resolve.outputs.action }}
+      write_candidate: ${{ steps.resolve.outputs.write_candidate }}
+      pr: ${{ steps.resolve.outputs.pr }}
+      gate_run: ${{ steps.resolve.outputs.gate_run }}
+      manifest_sha256: ${{ steps.resolve.outputs.manifest_sha256 }}
+    steps:
+      - name: Check out the lab at the workflow commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out the pinned Core planner files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: ${{ env.CORE_COMMIT }}
+          path: core
+          sparse-checkout: scripts/ci
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the pins before running any repository code
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          fail() { echo "::error::pin verification failed: $1"; exit 1; }
+          [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ] || fail "lab checkout is not the workflow commit"
+          [ "$(git -C core rev-parse HEAD)" = "$CORE_COMMIT" ] || fail "core checkout is not the pinned commit"
+          verify_core() {
+            entry="$(git -C core ls-tree HEAD -- "$1")"
+            mode="${entry%% *}"; blob="$(echo "$entry" | cut -d' ' -f3 | cut -f1)"
+            [ "$mode" = "100644" ] || fail "core file mode"
+            [ "$blob" = "$2" ] || fail "core file blob"
+          }
+          verify_core scripts/ci/render_pr_feedback.py "$CORE_RENDER_BLOB"
+          verify_core scripts/ci/publish_pr_feedback.py "$CORE_PUBLISH_BLOB"
+          # Every tracked path under ap1/, .github/ and .mneme/ must be a regular
+          # 100644 file (no symlinks, no other modes), and the working tree must
+          # hold exactly those files: nothing untracked, ignored or extra.
+          if git ls-files -s -- ap1 .github .mneme | awk -F'\t' '{ split($1, m, " "); if (m[1] != "100644" || m[3] != "0") bad = 1 } END { exit bad }'; then :; else fail "tracked file mode"; fi
+          [ -z "$(find ap1 .github .mneme -mindepth 1 ! -type f ! -type d)" ] || fail "non-regular entry"
+          [ -z "$(git status --porcelain --ignored -- ap1 .github .mneme)" ] || fail "untracked or modified file"
+          [ "$(find ap1 .github .mneme -type f | sort)" = "$(git ls-files -- ap1 .github .mneme | sort)" ] || fail "worktree differs from index"
+          if grep -Evq '^[0-9a-f]{64}  [A-Za-z0-9._/-]+$' ap1/PINS.sha256; then fail "manifest format"; fi
+          expected="$({ git ls-files -- ap1 .github .mneme | grep -Fxv ap1/PINS.sha256; printf '%s\n' \
+            core/scripts/ci/render_pr_feedback.py \
+            core/scripts/ci/publish_pr_feedback.py; } | sort)"
+          listed="$(sed -E 's/^[0-9a-f]{64}  //' ap1/PINS.sha256 | sort)"
+          [ "$expected" = "$listed" ] || fail "manifest path set"
+          sha256sum --check --strict --quiet ap1/PINS.sha256 || fail "sha256 mismatch"
+          echo "pins verified"
+
+      - name: Resolve (read-only observation and dry run)
+        id: resolve
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GATE_RUN_ID: ${{ github.event.workflow_run.id }}
+          EVIDENCE_PATH: ${{ runner.temp }}/ap1-evidence/observations.json
+        run: python3 -I ap1/resolve.py
+
+      - name: Preserve the resolve observations
+        if: ${{ !cancelled() && steps.resolve.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ap1-resolve-observations-${{ github.run_id }}
+          path: ${{ runner.temp }}/ap1-evidence/observations.json
+          if-no-files-found: error
+          retention-days: 90
+
+  write:
+    # B2.1 canary: NO KEY. References no secret and writes nothing to GitHub
+    # except its own evidence artifact.
+    name: AP1 feedback write
+    needs: resolve
+    if: ${{ needs.resolve.outputs.write_candidate == 'true' && github.run_attempt == '1' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: ap1-publisher-lab
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out the lab at the workflow commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out the pinned Core planner files
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.CORE_REPOSITORY }}
+          ref: ${{ env.CORE_COMMIT }}
+          path: core
+          sparse-checkout: scripts/ci
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the pins before running any repository code
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          fail() { echo "::error::pin verification failed: $1"; exit 1; }
+          [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ] || fail "lab checkout is not the workflow commit"
+          [ "$(git -C core rev-parse HEAD)" = "$CORE_COMMIT" ] || fail "core checkout is not the pinned commit"
+          verify_core() {
+            entry="$(git -C core ls-tree HEAD -- "$1")"
+            mode="${entry%% *}"; blob="$(echo "$entry" | cut -d' ' -f3 | cut -f1)"
+            [ "$mode" = "100644" ] || fail "core file mode"
+            [ "$blob" = "$2" ] || fail "core file blob"
+          }
+          verify_core scripts/ci/render_pr_feedback.py "$CORE_RENDER_BLOB"
+          verify_core scripts/ci/publish_pr_feedback.py "$CORE_PUBLISH_BLOB"
+          # Every tracked path under ap1/, .github/ and .mneme/ must be a regular
+          # 100644 file (no symlinks, no other modes), and the working tree must
+          # hold exactly those files: nothing untracked, ignored or extra.
+          if git ls-files -s -- ap1 .github .mneme | awk -F'\t' '{ split($1, m, " "); if (m[1] != "100644" || m[3] != "0") bad = 1 } END { exit bad }'; then :; else fail "tracked file mode"; fi
+          [ -z "$(find ap1 .github .mneme -mindepth 1 ! -type f ! -type d)" ] || fail "non-regular entry"
+          [ -z "$(git status --porcelain --ignored -- ap1 .github .mneme)" ] || fail "untracked or modified file"
+          [ "$(find ap1 .github .mneme -type f | sort)" = "$(git ls-files -- ap1 .github .mneme | sort)" ] || fail "worktree differs from index"
+          if grep -Evq '^[0-9a-f]{64}  [A-Za-z0-9._/-]+$' ap1/PINS.sha256; then fail "manifest format"; fi
+          expected="$({ git ls-files -- ap1 .github .mneme | grep -Fxv ap1/PINS.sha256; printf '%s\n' \
+            core/scripts/ci/render_pr_feedback.py \
+            core/scripts/ci/publish_pr_feedback.py; } | sort)"
+          listed="$(sed -E 's/^[0-9a-f]{64}  //' ap1/PINS.sha256 | sort)"
+          [ "$expected" = "$listed" ] || fail "manifest path set"
+          sha256sum --check --strict --quiet ap1/PINS.sha256 || fail "sha256 mismatch"
+          echo "pins verified"
+
+      - name: Record the canary observations (no key, no writes)
+        id: canary
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GATE_RUN_ID: ${{ github.event.workflow_run.id }}
+          RESOLVED_PR: ${{ needs.resolve.outputs.pr }}
+          RESOLVED_GATE_RUN: ${{ needs.resolve.outputs.gate_run }}
+          RESOLVED_MANIFEST_SHA256: ${{ needs.resolve.outputs.manifest_sha256 }}
+          EVIDENCE_PATH: ${{ runner.temp }}/ap1-evidence/canary.json
+        run: python3 -I ap1/write_canary.py
+
+      - name: Preserve the canary observations
+        if: ${{ !cancelled() && steps.canary.outcome != 'skipped' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ap1-write-canary-${{ github.run_id }}
+          path: ${{ runner.temp }}/ap1-evidence/canary.json
+          if-no-files-found: error
+          retention-days: 90
