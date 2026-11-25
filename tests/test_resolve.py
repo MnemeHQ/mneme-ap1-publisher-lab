@@ -341,3 +341,20 @@ def test_canary_rechecks_identity(world, repo_root, mut):
     mut(world, env)
     ev = W.run(env, world.api(), repo_root)
     assert ev["reject"] is not None and "gate" not in ev
+
+
+def test_h15a_is_recorded_even_when_the_gate_check_rejects(world, core_dir, repo_root):
+    world.run["run_attempt"] = 2
+    out, ev = _go(world, core_dir, repo_root)
+    assert ev["reject"] == "GATE_ATTEMPT" and out["write_candidate"] == "false"
+    assert ev["h15a"]["http_status"] == 200 and ev["h15a"]["event"] == "workflow_run"
+    assert ev["h15a"]["github_sha_vs_git_head"] == "match" and ev["own_identity"] == "ok"
+    assert "run_head_sha_vs_gate_head_sha" not in ev["h15a"]  # gate comparison only when the gate is known
+
+
+def test_summary_has_a_validated_write_candidate_line(world):
+    base = {"action": "CREATE", "pr": "7", "gate_run": "55", "manifest_sha256": "ab" * 32}
+    assert "- Write candidate: `true`\n" in R.render_summary(dict(world.env), dict(base, write_candidate="true"))
+    assert "- Write candidate: `false`\n" in R.render_summary(dict(world.env), dict(base, write_candidate="false"))
+    hostile = R.render_summary(dict(world.env), dict(base, write_candidate="::error::x\nyes"))
+    assert "- Write candidate: `false`\n" in hostile and "::error" not in hostile

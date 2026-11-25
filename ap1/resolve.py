@@ -118,7 +118,7 @@ def build_observed(ctx: dict, artifact: dict, zip_b64: str, definition_blob: str
 
 # ── observation helpers ──────────────────────────────────────────────────────
 
-def observe_self(api, env: dict, git_head: str, gate: dict | None = None) -> dict:
+def observe_self(api, env: dict, git_head: str) -> dict:
     """H15a: what the host says about THIS run versus what the job sees."""
     rid = C.dec(env.get("GITHUB_RUN_ID"), "BAD_RUN_ID")
     st, run = api.get(f"/repos/{C.REPO}/actions/runs/{rid}")
@@ -142,10 +142,15 @@ def observe_self(api, env: dict, git_head: str, gate: dict | None = None) -> dic
     rec["repository_id"] = C.dig(run, "repository", "id")
     st, wf = api.get(f"/repos/{C.REPO}/actions/workflows/{C.PUBLISHER_FILE}")
     rec["workflow_id_vs_file_lookup"] = flag(st == 200 and C.dig(wf, "id") == run.get("workflow_id"))
-    if gate is not None:  # what the host reports for a workflow_run: the triggering run's head, or main's?
-        rec["run_head_sha_vs_gate_head_sha"] = flag(run.get("head_sha") == gate.get("head_sha"))
-        rec["run_head_branch_vs_gate_head_branch"] = flag(run.get("head_branch") == gate.get("head_branch"))
     return rec
+
+
+def add_gate_comparison(rec: dict, gate_head_sha: str, gate_head_branch: object) -> None:
+    """What the host reports for a workflow_run: the triggering run's head, or main's?"""
+    if "head_sha" in rec:
+        rec["run_head_sha_vs_gate_head_sha"] = "match" if rec["head_sha"] == gate_head_sha else "mismatch"
+        rec["run_head_branch_vs_gate_head_branch"] = ("match" if rec.get("head_branch") == gate_head_branch
+                                                      else "mismatch")
 
 
 def git_head(repo_root: str) -> str:
@@ -208,6 +213,13 @@ def run(env: dict, api, repo_root: str, core_dir: str, head: str) -> tuple[dict,
         out["gate_run"] = gate_id
         ev["publisher"] = {"run_id": env.get("GITHUB_RUN_ID"), "run_attempt": env.get("GITHUB_RUN_ATTEMPT"),
                            "event": env.get("GITHUB_EVENT_NAME"), "ref": env.get("GITHUB_REF")}
+        # H15a first, so it is recorded even when the gate-run check rejects below.
+        ev["h15a"] = observe_self(api, env, head)
+        try:  # own-run identity gates write_candidate; observations are kept either way
+            C.own_identity(api, env, head)
+            ev["own_identity"] = "ok"
+        except C.Reject as err:
+            ev["own_identity"] = err.code
         ctx = C.gate_context(api, gate_id)
         out["pr"] = str(ctx["pr"])
         ev["gate"] = {"run_id": ctx["run"]["id"], "run_number": ctx["run"]["run_number"],
@@ -218,13 +230,7 @@ def run(env: dict, api, repo_root: str, core_dir: str, head: str) -> tuple[dict,
                       "base_sha": ctx["base_sha"], "pr": ctx["pr"],
                       "pr_base_ref": C.dig(ctx["pull"], "base", "ref"),
                       "identity": "partially_verified", "base_fresh_at_resolve": True}
-        ev["h15a"] = observe_self(api, env, head, {"head_sha": ctx["head_sha"],
-                                                   "head_branch": ctx["run"].get("head_branch")})
-        try:  # own-run identity gates write_candidate; the observations above are kept either way
-            C.own_identity(api, env, head)
-            ev["own_identity"] = "ok"
-        except C.Reject as err:
-            ev["own_identity"] = err.code
+        add_gate_comparison(ev["h15a"], ctx["head_sha"], ctx["run"].get("head_branch"))
 
         artifact, zip_bytes = fetch_artifact(api, gate_id, ctx["pr"])
         ev["artifact"] = {"count": 1, "size": artifact["size_in_bytes"], "expired": False, "zip": "inspected_ok"}
@@ -312,6 +318,7 @@ def render_summary(env: dict, out: dict) -> str:
         f"- Repository id: `{C.REPO_ID}`\n"
         f"- Pull request: `{out['pr']}`\n"
         f"- Proposed action: `{out['action']}`\n"
+        f"- Write candidate: `{'true' if out['write_candidate'] == 'true' else 'false'}`\n"
         f"- Expected posture (owner-approved constant, not verified): `{C.APPROVED_POSTURE}`\n"
         "\nPolicy check: pending (verified by writer before any write)\n"
     )
